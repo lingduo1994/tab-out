@@ -285,6 +285,310 @@ async function dismissSavedTab(id) {
 
 
 /* ----------------------------------------------------------------
+   PINNED SITES — chrome.storage.local
+
+   Up to PINNED_LIMIT entries; clicking a tile opens the URL in a
+   new tab (chrome.tabs.create). Storage shape:
+     pinnedSites = [{ id, url, title, addedAt }, ...]
+   ---------------------------------------------------------------- */
+
+const PINNED_LIMIT = 10;
+
+async function getPinnedSites() {
+  const { pinnedSites = [] } = await chrome.storage.local.get('pinnedSites');
+  return pinnedSites;
+}
+
+async function addPinnedSite({ url, title }) {
+  const pinnedSites = await getPinnedSites();
+  if (pinnedSites.length >= PINNED_LIMIT) {
+    throw new Error(`Pinned limit is ${PINNED_LIMIT}`);
+  }
+  pinnedSites.push({
+    id: Date.now().toString(),
+    url, title,
+    addedAt: new Date().toISOString(),
+  });
+  await chrome.storage.local.set({ pinnedSites });
+}
+
+async function updatePinnedSite(id, { url, title }) {
+  const pinnedSites = await getPinnedSites();
+  const item = pinnedSites.find(p => p.id === id);
+  if (!item) return;
+  item.url = url;
+  item.title = title;
+  await chrome.storage.local.set({ pinnedSites });
+}
+
+async function removePinnedSite(id) {
+  const pinnedSites = (await getPinnedSites()).filter(p => p.id !== id);
+  await chrome.storage.local.set({ pinnedSites });
+}
+
+/**
+ * reorderPinnedSites(idOrder)
+ *
+ * Persists a new order for the pinned tiles based on the given
+ * array of ids. Any ids missing from `idOrder` are appended at the
+ * end (defensive: should not happen but keeps state consistent).
+ */
+async function reorderPinnedSites(idOrder) {
+  const pinnedSites = await getPinnedSites();
+  const byId = new Map(pinnedSites.map(p => [p.id, p]));
+  const seen = new Set();
+  const reordered = [];
+  for (const id of idOrder) {
+    const item = byId.get(id);
+    if (item && !seen.has(id)) {
+      reordered.push(item);
+      seen.add(id);
+    }
+  }
+  for (const p of pinnedSites) {
+    if (!seen.has(p.id)) reordered.push(p);
+  }
+  await chrome.storage.local.set({ pinnedSites: reordered });
+}
+
+
+/* ----------------------------------------------------------------
+   SEARCH TEMPLATES — chrome.storage.local
+
+   Each template is { id, label, urlTemplate } where urlTemplate
+   must contain at least one `{}` placeholder. Filling a parameter
+   replaces every `{}` with encodeURIComponent(param).
+
+   Storage:
+     searchTemplates       = [{ id, label, urlTemplate, addedAt }, ...]
+     activeSearchTemplateId = "<id>"   // remembered across reloads
+   ---------------------------------------------------------------- */
+
+const TEMPLATE_LABEL_LIMIT = 12;
+
+async function getSearchTemplates() {
+  const { searchTemplates = [], activeSearchTemplateId = null } =
+    await chrome.storage.local.get(['searchTemplates', 'activeSearchTemplateId']);
+  return { templates: searchTemplates, activeId: activeSearchTemplateId };
+}
+
+async function addSearchTemplate({ label, urlTemplate }) {
+  validateTemplate({ label, urlTemplate });
+  const { templates } = await getSearchTemplates();
+  templates.push({
+    id: Date.now().toString(),
+    label: label.trim(),
+    urlTemplate: urlTemplate.trim(),
+    addedAt: new Date().toISOString(),
+  });
+  await chrome.storage.local.set({ searchTemplates: templates });
+}
+
+async function updateSearchTemplate(id, { label, urlTemplate }) {
+  validateTemplate({ label, urlTemplate });
+  const { templates } = await getSearchTemplates();
+  const item = templates.find(t => t.id === id);
+  if (!item) return;
+  item.label = label.trim();
+  item.urlTemplate = urlTemplate.trim();
+  await chrome.storage.local.set({ searchTemplates: templates });
+}
+
+async function removeSearchTemplate(id) {
+  const { templates, activeId } = await getSearchTemplates();
+  const filtered = templates.filter(t => t.id !== id);
+  const updates = { searchTemplates: filtered };
+  if (activeId === id) updates.activeSearchTemplateId = null;
+  // Drop the deleted template's parameter history too, so storage
+  // doesn't accumulate stale entries.
+  const { templateHistory = {} } = await chrome.storage.local.get('templateHistory');
+  if (templateHistory[id]) {
+    delete templateHistory[id];
+    updates.templateHistory = templateHistory;
+  }
+  await chrome.storage.local.set(updates);
+}
+
+
+/* ----------------------------------------------------------------
+   TEMPLATE PARAMETER HISTORY — chrome.storage.local
+
+   Per-template MRU of the last HISTORY_LIMIT parameters used.
+   Storage shape:
+     templateHistory = { "<templateId>": ["param1", "param2", ...] }
+   (Most recent first.)
+   ---------------------------------------------------------------- */
+
+const HISTORY_LIMIT = 3;
+
+async function getTemplateHistory(templateId) {
+  if (!templateId) return [];
+  const { templateHistory = {} } = await chrome.storage.local.get('templateHistory');
+  return Array.isArray(templateHistory[templateId]) ? templateHistory[templateId] : [];
+}
+
+async function addToTemplateHistory(templateId, param) {
+  if (!templateId || !param) return;
+  const { templateHistory = {} } = await chrome.storage.local.get('templateHistory');
+  const existing = Array.isArray(templateHistory[templateId]) ? templateHistory[templateId] : [];
+  // Dedupe + MRU bump + cap at HISTORY_LIMIT.
+  const updated = [param, ...existing.filter(p => p !== param)].slice(0, HISTORY_LIMIT);
+  templateHistory[templateId] = updated;
+  await chrome.storage.local.set({ templateHistory });
+}
+
+async function removeFromTemplateHistory(templateId, param) {
+  if (!templateId) return;
+  const { templateHistory = {} } = await chrome.storage.local.get('templateHistory');
+  const existing = Array.isArray(templateHistory[templateId]) ? templateHistory[templateId] : [];
+  const filtered = existing.filter(p => p !== param);
+  if (filtered.length === existing.length) return;
+  if (filtered.length === 0) delete templateHistory[templateId];
+  else templateHistory[templateId] = filtered;
+  await chrome.storage.local.set({ templateHistory });
+}
+
+async function setActiveTemplate(id) {
+  await chrome.storage.local.set({ activeSearchTemplateId: id });
+}
+
+/**
+ * reorderSearchTemplates(idOrder)
+ *
+ * Persists a new order for the chips based on the given array of
+ * template ids. Any ids missing from `idOrder` are appended (same
+ * defensive pattern as reorderPinnedSites). Affects the meaning of
+ * Cmd+1..5 since shortcut index follows array order.
+ */
+async function reorderSearchTemplates(idOrder) {
+  const { templates } = await getSearchTemplates();
+  const byId = new Map(templates.map(t => [t.id, t]));
+  const seen = new Set();
+  const reordered = [];
+  for (const id of idOrder) {
+    const item = byId.get(id);
+    if (item && !seen.has(id)) {
+      reordered.push(item);
+      seen.add(id);
+    }
+  }
+  for (const t of templates) {
+    if (!seen.has(t.id)) reordered.push(t);
+  }
+  await chrome.storage.local.set({ searchTemplates: reordered });
+}
+
+function validateTemplate({ label, urlTemplate }) {
+  const lab = (label || '').trim();
+  const tpl = (urlTemplate || '').trim();
+  if (!lab) throw new Error('Label is required');
+  if (lab.length > TEMPLATE_LABEL_LIMIT) {
+    throw new Error(`Label must be at most ${TEMPLATE_LABEL_LIMIT} chars`);
+  }
+  if (!tpl.includes('{}')) {
+    throw new Error('URL template must contain {} as the parameter placeholder');
+  }
+  try {
+    new URL(tpl.replace(/\{\}/g, 'x'));
+  } catch {
+    throw new Error('URL template is not a valid URL');
+  }
+}
+
+function expandTemplate(urlTemplate, param) {
+  const encoded = encodeURIComponent(param.trim());
+  return urlTemplate.replace(/\{\}/g, encoded);
+}
+
+
+/* ----------------------------------------------------------------
+   FIRST-RUN SEED from config.local.js
+
+   If chrome.storage.local has no pinnedSites / searchTemplates yet,
+   seed from LOCAL_PINNED_SITES / LOCAL_SEARCH_TEMPLATES if defined
+   in extension/config.local.js. Never overwrites existing user data.
+   ---------------------------------------------------------------- */
+async function maybeSeedFromConfig() {
+  const { pinnedSites, searchTemplates } =
+    await chrome.storage.local.get(['pinnedSites', 'searchTemplates']);
+
+  const updates = {};
+
+  if ((!pinnedSites || pinnedSites.length === 0)
+      && typeof LOCAL_PINNED_SITES !== 'undefined'
+      && Array.isArray(LOCAL_PINNED_SITES)) {
+    updates.pinnedSites = LOCAL_PINNED_SITES
+      .filter(p => p && p.url && p.title)
+      .slice(0, PINNED_LIMIT)
+      .map((p, i) => ({
+        id:      `seed-pin-${Date.now()}-${i}`,
+        url:     p.url,
+        title:   p.title,
+        addedAt: new Date().toISOString(),
+      }));
+  }
+
+  if ((!searchTemplates || searchTemplates.length === 0)
+      && typeof LOCAL_SEARCH_TEMPLATES !== 'undefined'
+      && Array.isArray(LOCAL_SEARCH_TEMPLATES)) {
+    updates.searchTemplates = LOCAL_SEARCH_TEMPLATES
+      .filter(t => t && t.label && t.urlTemplate && t.urlTemplate.includes('{}'))
+      .map((t, i) => ({
+        id:          `seed-tpl-${Date.now()}-${i}`,
+        label:       t.label.slice(0, TEMPLATE_LABEL_LIMIT),
+        urlTemplate: t.urlTemplate,
+        addedAt:     new Date().toISOString(),
+      }));
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await chrome.storage.local.set(updates);
+  }
+}
+
+
+/* ----------------------------------------------------------------
+   SMALL HTML ESCAPE HELPER — used for user-supplied strings that
+   land inside template literals (labels, URLs, titles).
+   ---------------------------------------------------------------- */
+function escAttr(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;');
+}
+
+function escText(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+
+/* ----------------------------------------------------------------
+   FAVICON URL — uses Chrome's own favicon cache via the MV3
+   `_favicon/` resource. Works for any URL Chrome has visited,
+   including private/internal hosts (e.g. *.bytedance.net) where
+   public favicon services like Google's can't reach.
+
+   Requires `"favicon"` permission + `_favicon/*` in
+   web_accessible_resources (see manifest.json).
+   ---------------------------------------------------------------- */
+function getFaviconUrl(pageUrl, size = 32) {
+  if (!pageUrl) return '';
+  try {
+    const u = new URL(chrome.runtime.getURL('/_favicon/'));
+    u.searchParams.set('pageUrl', pageUrl);
+    u.searchParams.set('size', String(size));
+    return u.toString();
+  } catch {
+    return '';
+  }
+}
+
+
+/* ----------------------------------------------------------------
    UI HELPERS
    ---------------------------------------------------------------- */
 
@@ -767,7 +1071,7 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
     const safeTitle = label.replace(/"/g, '&quot;');
     let domain = '';
     try { domain = new URL(tab.url).hostname; } catch {}
-    const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
+    const faviconUrl = getFaviconUrl(tab.url, 32);
     return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
       <span class="chip-text">${label}</span>${dupeTag}
@@ -848,7 +1152,7 @@ function renderDomainCard(group) {
     const safeTitle = label.replace(/"/g, '&quot;');
     let domain = '';
     try { domain = new URL(tab.url).hostname; } catch {}
-    const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
+    const faviconUrl = getFaviconUrl(tab.url, 32);
     return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
       <span class="chip-text">${label}</span>${dupeTag}
@@ -966,7 +1270,7 @@ async function renderDeferredColumn() {
 function renderDeferredItem(item) {
   let domain = '';
   try { domain = new URL(item.url).hostname.replace(/^www\./, ''); } catch {}
-  const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=16`;
+  const faviconUrl = getFaviconUrl(item.url, 32);
   const ago = timeAgo(item.savedAt);
 
   return `
@@ -995,12 +1299,337 @@ function renderDeferredItem(item) {
 function renderArchiveItem(item) {
   const ago = item.completedAt ? timeAgo(item.completedAt) : timeAgo(item.savedAt);
   return `
-    <div class="archive-item">
-      <a href="${item.url}" target="_blank" rel="noopener" class="archive-item-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
-        ${item.title || item.url}
+    <div class="archive-item" data-deferred-id="${escAttr(item.id)}">
+      <a href="${escAttr(item.url)}" target="_blank" rel="noopener" class="archive-item-title" title="${escAttr(item.title)}">
+        ${escText(item.title || item.url)}
       </a>
-      <span class="archive-item-date">${ago}</span>
+      <span class="archive-item-date">${escText(ago)}</span>
+      <button class="archive-dismiss" data-action="dismiss-deferred" data-deferred-id="${escAttr(item.id)}" title="Remove from archive" aria-label="Remove from archive">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+      </button>
     </div>`;
+}
+
+
+/* ----------------------------------------------------------------
+   PINNED ROW — Render header-right tiles
+   ---------------------------------------------------------------- */
+
+async function renderPinnedRow() {
+  const row = document.getElementById('pinnedRow');
+  if (!row) return;
+
+  const pinnedSites = await getPinnedSites();
+
+  const tiles = pinnedSites.map(p => {
+    let domain = '';
+    try { domain = new URL(p.url).hostname; } catch {}
+    const favicon  = getFaviconUrl(p.url, 32);
+    const initial  = ((p.title || domain || '?').trim().charAt(0) || '?').toUpperCase();
+    return `<button class="pinned-tile" draggable="true" data-action="open-pinned" data-pinned-id="${escAttr(p.id)}" data-pinned-url="${escAttr(p.url)}" title="${escAttr(p.title)}\n${escAttr(p.url)}">
+      <span class="pinned-favicon">
+        ${favicon ? `<img src="${escAttr(favicon)}" alt="" onerror="this.parentElement.classList.add('favicon-failed')">` : ''}
+        <span class="pinned-fallback">${escText(initial)}</span>
+      </span>
+      <span class="pinned-label">${escText(p.title)}</span>
+    </button>`;
+  }).join('');
+
+  const addBtn = pinnedSites.length < PINNED_LIMIT
+    ? `<button class="pinned-tile pinned-tile-add" data-action="manage-pinned" title="Add pinned site">+</button>`
+    : '';
+
+  row.innerHTML = tiles + addBtn;
+}
+
+
+/* ----------------------------------------------------------------
+   QUICK JUMP BAR — Render chips + input placeholder + enabled state
+   ---------------------------------------------------------------- */
+
+async function renderQuickJumpBar() {
+  const chips = document.getElementById('qjChips');
+  const input = document.getElementById('qjInput');
+  const goBtn = document.querySelector('#quickJumpBar .qj-go');
+  if (!chips || !input) return;
+
+  const { templates, activeId } = await getSearchTemplates();
+
+  // Pick the active template: stored choice, else first available.
+  let active = templates.find(t => t.id === activeId) || templates[0] || null;
+  if (active && active.id !== activeId) {
+    // Persist the implicit choice so chip highlight is stable across reloads.
+    setActiveTemplate(active.id);
+  }
+
+  const chipHtml = templates.map(t => {
+    const isActive = active && t.id === active.id;
+    return `<button class="qj-chip${isActive ? ' qj-chip-active' : ''}" draggable="true" data-action="select-template" data-template-id="${escAttr(t.id)}" title="${escAttr(t.urlTemplate)}">${escText(t.label)}</button>`;
+  }).join('');
+
+  const addChip = `<button class="qj-chip qj-chip-add" data-action="manage-templates" title="Add search template">+</button>`;
+  chips.innerHTML = chipHtml + addChip;
+
+  const hasTemplates = templates.length > 0;
+  input.disabled    = !hasTemplates;
+  input.placeholder = active ? `enter parameter for ${active.label}` : 'add a template to start';
+  if (goBtn) goBtn.disabled = !hasTemplates;
+
+  // If the input is currently focused, refresh the history dropdown
+  // so chip switches reflect the new template's MRU immediately.
+  if (document.activeElement === input) {
+    showHistoryDropdown();
+  } else {
+    hideHistoryDropdown();
+  }
+}
+
+
+/* ----------------------------------------------------------------
+   QUICK JUMP TRIGGER — expands the active template and opens the
+   resulting URL in a new tab.
+   ---------------------------------------------------------------- */
+
+async function triggerQuickJump() {
+  const input = document.getElementById('qjInput');
+  if (!input || input.disabled) return;
+
+  const param = (input.value || '').trim();
+  if (!param) {
+    showToast('Enter a parameter first');
+    input.focus();
+    return;
+  }
+
+  const { templates, activeId } = await getSearchTemplates();
+  const template = templates.find(t => t.id === activeId) || templates[0];
+  if (!template) return;
+
+  const url = expandTemplate(template.urlTemplate, param);
+  try { new URL(url); }
+  catch { showToast('Resulting URL is invalid'); return; }
+
+  // Record the parameter in the per-template MRU history before
+  // navigating, so it persists even if the user closes this tab.
+  await addToTemplateHistory(template.id, param);
+
+  await chrome.tabs.create({ url });
+  input.value = '';
+  hideHistoryDropdown();
+}
+
+
+/* ----------------------------------------------------------------
+   QUICK JUMP HISTORY DROPDOWN
+
+   Shows the per-template MRU parameters below #qjInput while it is
+   focused. Filtered by the current input value (substring match).
+   Clicking an item fills the input AND jumps immediately; keyboard
+   nav is wired in the global keydown listener at the bottom.
+   ---------------------------------------------------------------- */
+
+async function showHistoryDropdown() {
+  const input    = document.getElementById('qjInput');
+  const dropdown = document.getElementById('qjHistory');
+  if (!input || !dropdown) return;
+  if (input.disabled) { dropdown.style.display = 'none'; return; }
+
+  const { templates, activeId } = await getSearchTemplates();
+  const template = templates.find(t => t.id === activeId) || templates[0];
+  if (!template) { dropdown.style.display = 'none'; return; }
+
+  const history = await getTemplateHistory(template.id);
+  if (history.length === 0) { dropdown.style.display = 'none'; return; }
+
+  const query = (input.value || '').trim().toLowerCase();
+  const filtered = query
+    ? history.filter(h => h.toLowerCase().includes(query))
+    : history;
+
+  if (filtered.length === 0) { dropdown.style.display = 'none'; return; }
+
+  dropdown.innerHTML = filtered.map(h => `
+    <button class="qj-history-item" data-action="use-history-item" data-history-value="${escAttr(h)}" data-template-id="${escAttr(template.id)}">
+      <span class="qj-history-item-icon">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg>
+      </span>
+      <span class="qj-history-item-value">${escText(h)}</span>
+      <span class="qj-history-clear" data-action="forget-history-item" data-history-value="${escAttr(h)}" data-template-id="${escAttr(template.id)}" title="Forget this entry">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+      </span>
+    </button>
+  `).join('');
+  dropdown.style.display = 'block';
+}
+
+function hideHistoryDropdown() {
+  const dropdown = document.getElementById('qjHistory');
+  if (!dropdown) return;
+  dropdown.style.display = 'none';
+  dropdown.innerHTML = '';
+}
+
+
+/* ----------------------------------------------------------------
+   MANAGE DRAWER — right-slide editor for pinned sites + templates
+   ---------------------------------------------------------------- */
+
+function openManageDrawer(mode) {
+  const drawer = document.getElementById('manageDrawer');
+  const title  = document.getElementById('drawerTitle');
+  const body   = document.getElementById('drawerBody');
+  if (!drawer || !title || !body) return;
+
+  drawer.dataset.mode  = mode;
+  drawer.style.display = 'flex';
+
+  if (mode === 'pinned') {
+    title.textContent = 'Pinned sites';
+    renderPinnedDrawer(body);
+  } else if (mode === 'templates') {
+    title.textContent = 'Search templates';
+    renderTemplatesDrawer(body);
+  }
+
+  // Focus the first input for fast typing
+  setTimeout(() => {
+    const firstInput = body.querySelector('input');
+    if (firstInput) firstInput.focus();
+  }, 60);
+}
+
+function closeManageDrawer() {
+  const drawer = document.getElementById('manageDrawer');
+  if (!drawer) return;
+  drawer.style.display = 'none';
+  drawer.dataset.mode  = '';
+  const body = document.getElementById('drawerBody');
+  if (body) body.innerHTML = '';
+}
+
+async function renderPinnedDrawer(body) {
+  const pinnedSites = await getPinnedSites();
+
+  const listHtml = pinnedSites.length === 0
+    ? '<div class="drawer-empty">No pinned sites yet.</div>'
+    : `<ul class="drawer-list">${pinnedSites.map(p => renderPinnedDrawerRow(p)).join('')}</ul>`;
+
+  const canAdd = pinnedSites.length < PINNED_LIMIT;
+  const addHtml = canAdd
+    ? `<div class="drawer-add-form">
+        <h5>Add pinned site</h5>
+        <input type="text" id="newPinnedTitle" placeholder="Title (e.g. GitHub)" autocomplete="off" spellcheck="false" />
+        <input type="text" id="newPinnedUrl" placeholder="https://github.com" autocomplete="off" spellcheck="false" />
+        <div class="drawer-add-form-actions">
+          <button class="drawer-add-submit" data-action="submit-add-pinned">Add</button>
+        </div>
+        <div class="drawer-add-error" id="addPinnedError"></div>
+      </div>`
+    : `<div class="drawer-help">Pinned limit (${PINNED_LIMIT}) reached. Remove one to add a new one.</div>`;
+
+  body.innerHTML = `
+    <div class="drawer-section">
+      <h4>Pinned <span>(${pinnedSites.length}/${PINNED_LIMIT})</span></h4>
+      ${listHtml}
+      ${addHtml}
+    </div>
+  `;
+}
+
+function renderPinnedDrawerRow(p) {
+  let domain = '';
+  try { domain = new URL(p.url).hostname; } catch {}
+  const favicon = getFaviconUrl(p.url, 32);
+  return `<li data-pinned-id="${escAttr(p.id)}">
+    <div class="drawer-row-display">
+      ${favicon ? `<img src="${escAttr(favicon)}" alt="" onerror="this.style.display='none'">` : ''}
+      <span class="drawer-row-title">${escText(p.title)}</span>
+      <span class="drawer-row-meta">${escText(domain || p.url)}</span>
+      <span class="drawer-row-actions">
+        <button data-action="edit-pinned-row" data-pinned-id="${escAttr(p.id)}">Edit</button>
+        <button class="delete-btn" data-action="delete-pinned-row" data-pinned-id="${escAttr(p.id)}">Delete</button>
+      </span>
+    </div>
+  </li>`;
+}
+
+async function renderTemplatesDrawer(body) {
+  const { templates } = await getSearchTemplates();
+
+  const listHtml = templates.length === 0
+    ? '<div class="drawer-empty">No templates yet.</div>'
+    : `<ul class="drawer-list">${templates.map(t => renderTemplateDrawerRow(t)).join('')}</ul>`;
+
+  body.innerHTML = `
+    <div class="drawer-section">
+      <h4>Templates <span>(${templates.length})</span></h4>
+      ${listHtml}
+      <div class="drawer-add-form">
+        <h5>Add search template</h5>
+        <input type="text" id="newTemplateLabel" placeholder="Label (e.g. RDS)" maxlength="${TEMPLATE_LABEL_LIMIT}" autocomplete="off" spellcheck="false" />
+        <input type="text" id="newTemplateUrl" placeholder="https://example.com/{}/path" autocomplete="off" spellcheck="false" />
+        <div class="drawer-add-form-actions">
+          <button class="drawer-add-submit" data-action="submit-add-template">Add</button>
+        </div>
+        <div class="drawer-add-error" id="addTemplateError"></div>
+        <div class="drawer-help">Use <code>{}</code> as the placeholder for your parameter (URL-encoded on jump).</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderTemplateDrawerRow(t) {
+  return `<li data-template-id="${escAttr(t.id)}">
+    <div class="drawer-row-display">
+      <span class="drawer-chip">${escText(t.label)}</span>
+      <span class="drawer-row-meta" title="${escAttr(t.urlTemplate)}">${escText(t.urlTemplate)}</span>
+      <span class="drawer-row-actions">
+        <button data-action="edit-template-row" data-template-id="${escAttr(t.id)}">Edit</button>
+        <button class="delete-btn" data-action="delete-template-row" data-template-id="${escAttr(t.id)}">Delete</button>
+      </span>
+    </div>
+  </li>`;
+}
+
+function switchToEditMode(li, mode, item) {
+  if (mode === 'pinned') {
+    li.innerHTML = `
+      <div class="drawer-row-edit">
+        <input type="text" data-field="title" value="${escAttr(item.title)}" placeholder="Title" />
+        <input type="text" data-field="url" value="${escAttr(item.url)}" placeholder="https://..." />
+        <div class="drawer-row-edit-actions">
+          <button class="save-btn" data-action="save-pinned-row" data-pinned-id="${escAttr(item.id)}">Save</button>
+          <button data-action="cancel-edit-row">Cancel</button>
+          <span class="inline-error"></span>
+        </div>
+      </div>
+    `;
+  } else {
+    li.innerHTML = `
+      <div class="drawer-row-edit">
+        <input type="text" data-field="label" value="${escAttr(item.label)}" placeholder="Label" maxlength="${TEMPLATE_LABEL_LIMIT}" />
+        <input type="text" data-field="urlTemplate" value="${escAttr(item.urlTemplate)}" placeholder="https://example.com/{}/path" />
+        <div class="drawer-row-edit-actions">
+          <button class="save-btn" data-action="save-template-row" data-template-id="${escAttr(item.id)}">Save</button>
+          <button data-action="cancel-edit-row">Cancel</button>
+          <span class="inline-error"></span>
+        </div>
+      </div>
+    `;
+  }
+  const firstInput = li.querySelector('input');
+  if (firstInput) firstInput.focus();
+}
+
+/* Re-render the drawer body for the currently open mode (after a
+   storage update) without recreating the drawer chrome. */
+async function refreshDrawer() {
+  const drawer = document.getElementById('manageDrawer');
+  const body   = document.getElementById('drawerBody');
+  if (!drawer || !body) return;
+  const mode = drawer.dataset.mode;
+  if (mode === 'pinned')         await renderPinnedDrawer(body);
+  else if (mode === 'templates') await renderTemplatesDrawer(body);
 }
 
 
@@ -1025,6 +1654,10 @@ async function renderStaticDashboard() {
   const dateEl     = document.getElementById('dateDisplay');
   if (greetingEl) greetingEl.textContent = getGreeting();
   if (dateEl)     dateEl.textContent     = getDateDisplay();
+
+  // --- Pinned + Quick Jump (independent of tab data) ---
+  await renderPinnedRow();
+  await renderQuickJumpBar();
 
   // --- Fetch tabs ---
   await fetchOpenTabs();
@@ -1169,7 +1802,17 @@ async function renderStaticDashboard() {
 }
 
 async function renderDashboard() {
+  await maybeSeedFromConfig();
   await renderStaticDashboard();
+}
+
+/* Show the platform-appropriate keyboard hint in the Quick Jump bar.
+   Mac → ⌘K, others → Ctrl+K. Runs once at startup. */
+function updateShortcutLabel() {
+  const kbd = document.getElementById('qjShortcut');
+  if (!kbd) return;
+  const isMac = /Mac/i.test(navigator.platform);
+  kbd.textContent = isMac ? '⌘K' : 'Ctrl+K';
 }
 
 
@@ -1322,20 +1965,24 @@ document.addEventListener('click', async (e) => {
     return;
   }
 
-  // ---- Dismiss a saved tab (removes it entirely) ----
+  // ---- Dismiss a saved tab (works for both active and archive) ----
   if (action === 'dismiss-deferred') {
     const id = actionEl.dataset.deferredId;
     if (!id) return;
 
     await dismissSavedTab(id);
 
-    const item = actionEl.closest('.deferred-item');
+    const item = actionEl.closest('.deferred-item, .archive-item');
     if (item) {
       item.classList.add('removing');
       setTimeout(() => {
         item.remove();
         renderDeferredColumn();
       }, 300);
+    } else {
+      // Fallback: archive search results may live in a different
+      // structure; just re-render the column.
+      renderDeferredColumn();
     }
     return;
   }
@@ -1431,6 +2078,226 @@ document.addEventListener('click', async (e) => {
     showToast('All tabs closed. Fresh start.');
     return;
   }
+
+  /* ============================================================
+     PINNED SITES + SEARCH TEMPLATES — handlers
+     ============================================================ */
+
+  // ---- Open a pinned site in a new tab ----
+  if (action === 'open-pinned') {
+    const url = actionEl.dataset.pinnedUrl;
+    if (url) await chrome.tabs.create({ url });
+    return;
+  }
+
+  // ---- Open the manage drawer for pinned ----
+  if (action === 'manage-pinned') {
+    openManageDrawer('pinned');
+    return;
+  }
+
+  // ---- Open the manage drawer for templates ----
+  if (action === 'manage-templates') {
+    openManageDrawer('templates');
+    return;
+  }
+
+  // ---- Close the manage drawer ----
+  if (action === 'close-drawer') {
+    closeManageDrawer();
+    return;
+  }
+
+  // ---- Submit the "add pinned" form ----
+  if (action === 'submit-add-pinned') {
+    const titleInput = document.getElementById('newPinnedTitle');
+    const urlInput   = document.getElementById('newPinnedUrl');
+    const errEl      = document.getElementById('addPinnedError');
+    const title = (titleInput?.value || '').trim();
+    const url   = (urlInput?.value   || '').trim();
+    if (errEl) errEl.textContent = '';
+
+    if (!title || !url) {
+      if (errEl) errEl.textContent = 'Title and URL are both required';
+      return;
+    }
+    try { new URL(url); }
+    catch { if (errEl) errEl.textContent = 'URL is not valid'; return; }
+
+    try {
+      await addPinnedSite({ url, title });
+      if (titleInput) titleInput.value = '';
+      if (urlInput)   urlInput.value   = '';
+      await renderPinnedRow();
+      await refreshDrawer();
+      showToast('Pinned added');
+    } catch (err) {
+      if (errEl) errEl.textContent = err.message;
+    }
+    return;
+  }
+
+  // ---- Switch a pinned row into inline edit mode ----
+  if (action === 'edit-pinned-row') {
+    const id = actionEl.dataset.pinnedId;
+    const li = actionEl.closest('li');
+    const pinnedSites = await getPinnedSites();
+    const item = pinnedSites.find(p => p.id === id);
+    if (li && item) switchToEditMode(li, 'pinned', item);
+    return;
+  }
+
+  // ---- Cancel inline edit (re-render whole drawer body) ----
+  if (action === 'cancel-edit-row') {
+    await refreshDrawer();
+    return;
+  }
+
+  // ---- Save inline-edited pinned row ----
+  if (action === 'save-pinned-row') {
+    const id = actionEl.dataset.pinnedId;
+    const li = actionEl.closest('li');
+    const titleInput = li.querySelector('input[data-field="title"]');
+    const urlInput   = li.querySelector('input[data-field="url"]');
+    const errEl      = li.querySelector('.inline-error');
+    const title = (titleInput?.value || '').trim();
+    const url   = (urlInput?.value   || '').trim();
+    if (errEl) errEl.textContent = '';
+
+    if (!title || !url) {
+      if (errEl) errEl.textContent = 'Both fields required';
+      return;
+    }
+    try { new URL(url); }
+    catch { if (errEl) errEl.textContent = 'URL is not valid'; return; }
+
+    try {
+      await updatePinnedSite(id, { url, title });
+      await renderPinnedRow();
+      await refreshDrawer();
+      showToast('Pinned updated');
+    } catch (err) {
+      if (errEl) errEl.textContent = err.message;
+    }
+    return;
+  }
+
+  // ---- Delete a pinned row ----
+  if (action === 'delete-pinned-row') {
+    if (!confirm('Remove this pinned site?')) return;
+    const id = actionEl.dataset.pinnedId;
+    await removePinnedSite(id);
+    await renderPinnedRow();
+    await refreshDrawer();
+    showToast('Pinned removed');
+    return;
+  }
+
+  // ---- Submit the "add template" form ----
+  if (action === 'submit-add-template') {
+    const labelInput = document.getElementById('newTemplateLabel');
+    const urlInput   = document.getElementById('newTemplateUrl');
+    const errEl      = document.getElementById('addTemplateError');
+    const label       = (labelInput?.value || '').trim();
+    const urlTemplate = (urlInput?.value   || '').trim();
+    if (errEl) errEl.textContent = '';
+
+    try {
+      await addSearchTemplate({ label, urlTemplate });
+      if (labelInput) labelInput.value = '';
+      if (urlInput)   urlInput.value   = '';
+      await renderQuickJumpBar();
+      await refreshDrawer();
+      showToast('Template added');
+    } catch (err) {
+      if (errEl) errEl.textContent = err.message;
+    }
+    return;
+  }
+
+  // ---- Switch a template row into inline edit mode ----
+  if (action === 'edit-template-row') {
+    const id = actionEl.dataset.templateId;
+    const li = actionEl.closest('li');
+    const { templates } = await getSearchTemplates();
+    const item = templates.find(t => t.id === id);
+    if (li && item) switchToEditMode(li, 'templates', item);
+    return;
+  }
+
+  // ---- Save inline-edited template row ----
+  if (action === 'save-template-row') {
+    const id = actionEl.dataset.templateId;
+    const li = actionEl.closest('li');
+    const labelInput = li.querySelector('input[data-field="label"]');
+    const urlInput   = li.querySelector('input[data-field="urlTemplate"]');
+    const errEl      = li.querySelector('.inline-error');
+    const label       = (labelInput?.value || '').trim();
+    const urlTemplate = (urlInput?.value   || '').trim();
+    if (errEl) errEl.textContent = '';
+
+    try {
+      await updateSearchTemplate(id, { label, urlTemplate });
+      await renderQuickJumpBar();
+      await refreshDrawer();
+      showToast('Template updated');
+    } catch (err) {
+      if (errEl) errEl.textContent = err.message;
+    }
+    return;
+  }
+
+  // ---- Delete a template row ----
+  if (action === 'delete-template-row') {
+    if (!confirm('Remove this search template?')) return;
+    const id = actionEl.dataset.templateId;
+    await removeSearchTemplate(id);
+    await renderQuickJumpBar();
+    await refreshDrawer();
+    showToast('Template removed');
+    return;
+  }
+
+  // ---- Select a chip → make it the active Quick Jump template ----
+  if (action === 'select-template') {
+    const id = actionEl.dataset.templateId;
+    if (!id) return;
+    await setActiveTemplate(id);
+    await renderQuickJumpBar();
+    const input = document.getElementById('qjInput');
+    if (input) input.focus();
+    return;
+  }
+
+  // ---- Run the Quick Jump ----
+  if (action === 'quick-jump-go') {
+    await triggerQuickJump();
+    return;
+  }
+
+  // ---- Pick a history item → fill input + jump immediately ----
+  if (action === 'use-history-item') {
+    const value = actionEl.dataset.historyValue;
+    const input = document.getElementById('qjInput');
+    if (input && value != null) {
+      input.value = value;
+      hideHistoryDropdown();
+      await triggerQuickJump();
+    }
+    return;
+  }
+
+  // ---- Forget a single history entry ----
+  if (action === 'forget-history-item') {
+    e.stopPropagation();   // don't also trigger use-history-item on the parent
+    const templateId = actionEl.dataset.templateId;
+    const value      = actionEl.dataset.historyValue;
+    if (templateId && value != null) {
+      await removeFromTemplateHistory(templateId, value);
+      await showHistoryDropdown();
+    }
+    return;
+  }
 });
 
 // ---- Archive toggle — expand/collapse the archive section ----
@@ -1477,6 +2344,264 @@ document.addEventListener('input', async (e) => {
 
 
 /* ----------------------------------------------------------------
+   KEYBOARD SHORTCUTS
+
+   - Enter inside Quick Jump input → trigger the jump
+   - Escape inside the open drawer → close drawer
+   - Cmd/Ctrl + K → focus + flash the Quick Jump input
+   - Cmd/Ctrl + 1..5 → pick the Nth chip and focus the input
+   ---------------------------------------------------------------- */
+document.addEventListener('keydown', async (e) => {
+  // Quick Jump input keys take precedence over the global Cmd+K
+  // path when the input is focused.
+  if (e.target && e.target.id === 'qjInput') {
+
+    // Enter → if a history item is highlighted, use it; else jump
+    // with the current input value.
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const dropdown = document.getElementById('qjHistory');
+      if (dropdown && dropdown.style.display !== 'none') {
+        const highlighted = dropdown.querySelector('.qj-history-item.highlighted');
+        if (highlighted) {
+          e.target.value = highlighted.dataset.historyValue || '';
+          hideHistoryDropdown();
+        }
+      }
+      await triggerQuickJump();
+      return;
+    }
+
+    // ↓/↑ → navigate history dropdown (open it if hidden on ↓)
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const dropdown = document.getElementById('qjHistory');
+      if (!dropdown) return;
+
+      if (dropdown.style.display === 'none') {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          await showHistoryDropdown();
+          const first = dropdown.querySelector('.qj-history-item');
+          if (first) first.classList.add('highlighted');
+        }
+        return;
+      }
+
+      const items = Array.from(dropdown.querySelectorAll('.qj-history-item'));
+      if (items.length === 0) return;
+      e.preventDefault();
+      let idx = items.findIndex(el => el.classList.contains('highlighted'));
+      if (e.key === 'ArrowDown') {
+        idx = idx < 0 ? 0 : (idx + 1) % items.length;
+      } else {
+        idx = idx <= 0 ? items.length - 1 : idx - 1;
+      }
+      items.forEach((el, i) => el.classList.toggle('highlighted', i === idx));
+      items[idx].scrollIntoView({ block: 'nearest' });
+      return;
+    }
+
+    // Escape inside qjInput → close history dropdown (if open),
+    // otherwise fall through to the global Escape handler.
+    if (e.key === 'Escape') {
+      const dropdown = document.getElementById('qjHistory');
+      if (dropdown && dropdown.style.display !== 'none') {
+        e.preventDefault();
+        hideHistoryDropdown();
+        return;
+      }
+    }
+  }
+
+  // Escape → close drawer (if open)
+  if (e.key === 'Escape') {
+    const drawer = document.getElementById('manageDrawer');
+    if (drawer && drawer.style.display !== 'none') {
+      e.preventDefault();
+      closeManageDrawer();
+      return;
+    }
+  }
+
+  const mod = e.metaKey || e.ctrlKey;
+  if (!mod) return;
+
+  // Cmd/Ctrl + K → focus Quick Jump input
+  if (e.key === 'k' || e.key === 'K') {
+    const input = document.getElementById('qjInput');
+    if (input && !input.disabled) {
+      e.preventDefault();
+      input.focus();
+      input.select();
+      const bar = document.getElementById('quickJumpBar');
+      if (bar) {
+        bar.classList.add('flash-focus');
+        setTimeout(() => bar.classList.remove('flash-focus'), 400);
+      }
+    }
+    return;
+  }
+
+  // Cmd/Ctrl + 1..5 → activate Nth template
+  if (e.key >= '1' && e.key <= '5') {
+    const n = parseInt(e.key, 10) - 1;
+    const { templates } = await getSearchTemplates();
+    if (templates[n]) {
+      e.preventDefault();
+      await setActiveTemplate(templates[n].id);
+      await renderQuickJumpBar();
+      const input = document.getElementById('qjInput');
+      if (input) input.focus();
+    }
+  }
+});
+
+
+/* ----------------------------------------------------------------
+   HTML5 DRAG-AND-DROP REORDER — generic horizontal list helper
+
+   Used by the pinned row and the Quick Jump chip row, which share
+   the same interaction model:
+   - horizontal flex container
+   - each item carries a stable id (dataset key)
+   - a trailing "+" item must never be a drag source or target
+   - drop indicator is a 2-3px amber bar at the left/right edge of
+     the target, chosen by whether the cursor is on the left or
+     right half of the target's bounding rect
+   - reorder is persisted once on drop, then the row is re-rendered
+
+   Listeners are attached to the static container element, so they
+   survive child re-renders.
+   ---------------------------------------------------------------- */
+function wireHorizontalReorder({
+  container,        // HTMLElement — static parent
+  itemSelector,     // CSS selector for item elements (incl. the "+")
+  isRealItem,       // (el) => boolean — false for the "+" / non-items
+  getId,            // (el) => string  — read item id from dataset
+  applyReorder,     // async (newIdOrder: string[]) => void
+  onAfterReorder,   // async () => void — usually a re-render
+}) {
+  if (!container) return;
+  let draggedId = null;
+
+  const indicatorSel = `${itemSelector}.drop-before, ${itemSelector}.drop-after`;
+
+  function clearIndicators() {
+    container.querySelectorAll(indicatorSel)
+      .forEach(el => el.classList.remove('drop-before', 'drop-after'));
+  }
+
+  function cleanup() {
+    container.querySelectorAll(`${itemSelector}.dragging`)
+      .forEach(el => el.classList.remove('dragging'));
+    clearIndicators();
+    draggedId = null;
+  }
+
+  container.addEventListener('dragstart', (e) => {
+    const item = e.target.closest(itemSelector);
+    if (!isRealItem(item)) { e.preventDefault(); return; }
+    draggedId = getId(item);
+    item.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    // setData is required for Firefox compatibility — Chrome works without it.
+    try { e.dataTransfer.setData('text/plain', draggedId); } catch {}
+  });
+
+  container.addEventListener('dragover', (e) => {
+    if (!draggedId) return;
+    const item = e.target.closest(itemSelector);
+    if (!isRealItem(item) || getId(item) === draggedId) {
+      clearIndicators();
+      return;
+    }
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const rect = item.getBoundingClientRect();
+    const isLeftHalf = e.clientX < rect.left + rect.width / 2;
+    clearIndicators();
+    item.classList.add(isLeftHalf ? 'drop-before' : 'drop-after');
+  });
+
+  container.addEventListener('dragleave', (e) => {
+    // Only clear if we've actually left the container; moving
+    // between child items shouldn't blank the indicator.
+    if (e.relatedTarget && container.contains(e.relatedTarget)) return;
+    clearIndicators();
+  });
+
+  container.addEventListener('drop', async (e) => {
+    if (!draggedId) return;
+    const item = e.target.closest(itemSelector);
+    if (!isRealItem(item) || getId(item) === draggedId) {
+      cleanup();
+      return;
+    }
+    e.preventDefault();
+    const targetId    = getId(item);
+    const insertAfter = item.classList.contains('drop-after');
+
+    // Build the new order from the current DOM (resilient to any
+    // shifts in storage between dragstart and drop).
+    const items = Array.from(container.querySelectorAll(itemSelector)).filter(isRealItem);
+    const ids   = items.map(getId);
+    const withoutDragged = ids.filter(id => id !== draggedId);
+    const targetIdx = withoutDragged.indexOf(targetId);
+    if (targetIdx === -1) { cleanup(); return; }
+    withoutDragged.splice(insertAfter ? targetIdx + 1 : targetIdx, 0, draggedId);
+
+    await applyReorder(withoutDragged);
+    cleanup();
+    if (onAfterReorder) await onAfterReorder();
+  });
+
+  container.addEventListener('dragend', cleanup);
+}
+
+/* ---- Pinned tiles ---- */
+wireHorizontalReorder({
+  container:      document.getElementById('pinnedRow'),
+  itemSelector:   '.pinned-tile',
+  isRealItem:     el => !!el && el.classList.contains('pinned-tile') && !el.classList.contains('pinned-tile-add'),
+  getId:          el => el.dataset.pinnedId,
+  applyReorder:   reorderPinnedSites,
+  onAfterReorder: renderPinnedRow,
+});
+
+/* ---- Quick Jump chips ---- */
+wireHorizontalReorder({
+  container:      document.getElementById('qjChips'),
+  itemSelector:   '.qj-chip',
+  isRealItem:     el => !!el && el.classList.contains('qj-chip') && !el.classList.contains('qj-chip-add'),
+  getId:          el => el.dataset.templateId,
+  applyReorder:   reorderSearchTemplates,
+  onAfterReorder: renderQuickJumpBar,
+});
+
+
+/* ----------------------------------------------------------------
+   QUICK JUMP INPUT — focus/blur/input wiring for history dropdown
+   ---------------------------------------------------------------- */
+(function wireQuickJumpHistory() {
+  const input    = document.getElementById('qjInput');
+  const dropdown = document.getElementById('qjHistory');
+  if (!input || !dropdown) return;
+
+  input.addEventListener('focus', showHistoryDropdown);
+  input.addEventListener('input', showHistoryDropdown);
+  // Delay so a click on a dropdown item can fire before we hide it.
+  input.addEventListener('blur', () => setTimeout(hideHistoryDropdown, 150));
+
+  // Prevent blur when clicking inside the dropdown — keeps the
+  // input focused so the click handler receives the event cleanly.
+  dropdown.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+  });
+})();
+
+
+/* ----------------------------------------------------------------
    INITIALIZE
    ---------------------------------------------------------------- */
+updateShortcutLabel();
 renderDashboard();
