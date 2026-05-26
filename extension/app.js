@@ -283,6 +283,27 @@ async function dismissSavedTab(id) {
   }
 }
 
+/**
+ * clearArchivedTabs()
+ *
+ * Sweeps every completed-but-not-yet-dismissed saved tab into 'dismissed'.
+ * Returns the number of items cleared so callers can show a toast.
+ */
+async function clearArchivedTabs() {
+  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  let cleared = 0;
+  for (const t of deferred) {
+    if (t.completed && !t.dismissed) {
+      t.dismissed = true;
+      cleared++;
+    }
+  }
+  if (cleared > 0) {
+    await chrome.storage.local.set({ deferred });
+  }
+  return cleared;
+}
+
 
 /* ----------------------------------------------------------------
    PINNED SITES — chrome.storage.local
@@ -1984,6 +2005,18 @@ document.addEventListener('click', async (e) => {
       // structure; just re-render the column.
       renderDeferredColumn();
     }
+    return;
+  }
+
+  // ---- Clear all archived saved tabs ----
+  if (action === 'clear-archive') {
+    const { archived } = await getSavedTabs();
+    if (archived.length === 0) return;
+    const noun = archived.length === 1 ? 'tab' : 'tabs';
+    if (!confirm(`Clear ${archived.length} archived ${noun}? This cannot be undone.`)) return;
+    const cleared = await clearArchivedTabs();
+    renderDeferredColumn();
+    showToast(`Cleared ${cleared} archived ${cleared === 1 ? 'tab' : 'tabs'}`);
     return;
   }
 
