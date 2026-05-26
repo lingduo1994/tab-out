@@ -569,6 +569,113 @@ async function maybeSeedFromConfig() {
 
 
 /* ----------------------------------------------------------------
+   CONFIG EXPORT / LOAD
+
+   Two manual actions, exposed in both manage drawers:
+
+   - exportConfig()  builds a config.local.js mirroring current
+                     chrome.storage and triggers a browser download.
+   - loadFromConfig() takes whatever LOCAL_* globals are in scope
+                     (loaded from extension/config.local.js at
+                     startup) and OVERWRITES pinnedSites +
+                     searchTemplates in chrome.storage, then clears
+                     templateHistory because template ids changed.
+   ---------------------------------------------------------------- */
+
+async function buildConfigFileContent() {
+  const pinned          = await getPinnedSites();
+  const { templates }   = await getSearchTemplates();
+  const landingPatterns = (typeof LOCAL_LANDING_PAGE_PATTERNS !== 'undefined'
+                          && Array.isArray(LOCAL_LANDING_PAGE_PATTERNS))
+                         ? LOCAL_LANDING_PAGE_PATTERNS : [];
+  const customGroups    = (typeof LOCAL_CUSTOM_GROUPS !== 'undefined'
+                          && Array.isArray(LOCAL_CUSTOM_GROUPS))
+                         ? LOCAL_CUSTOM_GROUPS : [];
+
+  // Strip internal fields so the file stays human-readable / diff-friendly
+  const pinnedClean    = pinned.map(p   => ({ title: p.title, url: p.url }));
+  const templatesClean = templates.map(t => ({ label: t.label, urlTemplate: t.urlTemplate }));
+
+  const fmt = arr => arr.length === 0
+    ? '[]'
+    : '[\n' + arr.map(o => '  ' + JSON.stringify(o)).join(',\n') + '\n]';
+
+  return `/* ============================================================
+   Tab Out — Personal config (gitignored)
+   Exported on ${new Date().toISOString()}
+
+   On first run (storage empty), maybeSeedFromConfig copies the
+   LOCAL_* values below into chrome.storage. After that, edits via
+   the UI live in chrome.storage and this file becomes stale.
+   Use "Load from config.local.js" in the manage drawer to apply
+   this file on top of existing storage.
+   ============================================================ */
+
+const LOCAL_LANDING_PAGE_PATTERNS = ${fmt(landingPatterns)};
+
+const LOCAL_CUSTOM_GROUPS = ${fmt(customGroups)};
+
+const LOCAL_PINNED_SITES = ${fmt(pinnedClean)};
+
+const LOCAL_SEARCH_TEMPLATES = ${fmt(templatesClean)};
+`;
+}
+
+async function exportConfig() {
+  const content = await buildConfigFileContent();
+  const blob = new Blob([content], { type: 'application/javascript' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = 'config.local.js';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+async function loadFromConfig() {
+  const hasPinned    = typeof LOCAL_PINNED_SITES    !== 'undefined' && Array.isArray(LOCAL_PINNED_SITES);
+  const hasTemplates = typeof LOCAL_SEARCH_TEMPLATES !== 'undefined' && Array.isArray(LOCAL_SEARCH_TEMPLATES);
+  if (!hasPinned && !hasTemplates) return null;
+
+  const updates = {};
+  const stamp   = Date.now();
+
+  if (hasPinned) {
+    updates.pinnedSites = LOCAL_PINNED_SITES
+      .filter(p => p && p.url && p.title)
+      .slice(0, PINNED_LIMIT)
+      .map((p, i) => ({
+        id:      `load-pin-${stamp}-${i}`,
+        url:     p.url,
+        title:   p.title,
+        addedAt: new Date().toISOString(),
+      }));
+  }
+
+  if (hasTemplates) {
+    updates.searchTemplates = LOCAL_SEARCH_TEMPLATES
+      .filter(t => t && t.label && t.urlTemplate && t.urlTemplate.includes('{}'))
+      .map((t, i) => ({
+        id:          `load-tpl-${stamp}-${i}`,
+        label:       t.label.slice(0, TEMPLATE_LABEL_LIMIT),
+        urlTemplate: t.urlTemplate,
+        addedAt:     new Date().toISOString(),
+      }));
+    // Template ids changed, so any per-template MRU history is orphaned
+    updates.templateHistory = {};
+  }
+
+  await chrome.storage.local.set(updates);
+  return {
+    pinnedCount:   updates.pinnedSites?.length    ?? 0,
+    templateCount: updates.searchTemplates?.length ?? 0,
+  };
+}
+
+
+/* ----------------------------------------------------------------
    SMALL HTML ESCAPE HELPER — used for user-supplied strings that
    land inside template literals (labels, URLs, titles).
    ---------------------------------------------------------------- */
@@ -1554,6 +1661,20 @@ async function renderPinnedDrawer(body) {
       ${listHtml}
       ${addHtml}
     </div>
+    ${renderConfigFileSection()}
+  `;
+}
+
+function renderConfigFileSection() {
+  return `
+    <div class="drawer-section drawer-config-section">
+      <h4>Config file</h4>
+      <p class="drawer-help">Back up pinned sites and search templates to <code>extension/config.local.js</code>, or reload that file into storage.</p>
+      <div class="drawer-config-actions">
+        <button class="drawer-config-btn" data-action="export-config" title="Download a config.local.js mirroring your current pinned sites and search templates">Export to config.local.js</button>
+        <button class="drawer-config-btn drawer-config-btn-danger" data-action="load-from-config" title="Replace pinned sites and search templates with what is in config.local.js (clears template parameter history)">Load from config.local.js</button>
+      </div>
+    </div>
   `;
 }
 
@@ -1596,6 +1717,7 @@ async function renderTemplatesDrawer(body) {
         <div class="drawer-help">Use <code>{}</code> as the placeholder for your parameter (URL-encoded on jump).</div>
       </div>
     </div>
+    ${renderConfigFileSection()}
   `;
 }
 
@@ -2138,6 +2260,42 @@ document.addEventListener('click', async (e) => {
   // ---- Close the manage drawer ----
   if (action === 'close-drawer') {
     closeManageDrawer();
+    return;
+  }
+
+  // ---- Export current config to a downloadable config.local.js ----
+  if (action === 'export-config') {
+    try {
+      await exportConfig();
+      showToast('Downloaded config.local.js — replace extension/config.local.js, then reload the extension');
+    } catch (err) {
+      console.warn('[tab-out] export failed:', err);
+      showToast('Export failed');
+    }
+    return;
+  }
+
+  // ---- Load pinned + templates from config.local.js (overwrites storage) ----
+  if (action === 'load-from-config') {
+    const hasPinned    = typeof LOCAL_PINNED_SITES    !== 'undefined' && Array.isArray(LOCAL_PINNED_SITES);
+    const hasTemplates = typeof LOCAL_SEARCH_TEMPLATES !== 'undefined' && Array.isArray(LOCAL_SEARCH_TEMPLATES);
+    if (!hasPinned && !hasTemplates) {
+      showToast('config.local.js not found or has no LOCAL_PINNED_SITES / LOCAL_SEARCH_TEMPLATES');
+      return;
+    }
+    if (!confirm('Load from config.local.js? This will REPLACE your current pinned sites and search templates, and clear template parameter history. Continue?')) {
+      return;
+    }
+    try {
+      const result = await loadFromConfig();
+      await refreshDrawer();
+      await renderPinnedRow();
+      await renderQuickJumpBar();
+      showToast(`Loaded ${result.pinnedCount} pinned + ${result.templateCount} templates`);
+    } catch (err) {
+      console.warn('[tab-out] load failed:', err);
+      showToast('Load failed');
+    }
     return;
   }
 
