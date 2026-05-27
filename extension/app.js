@@ -863,6 +863,77 @@ function animateCardOut(card) {
 }
 
 /**
+ * recomputeOpenTabsCounts(ownerCard)
+ *
+ * After a single tab is closed (close-single-tab) or saved (defer-single-tab),
+ * the badge text, "Close all N" button, "N duplicates" badge, "Close N
+ * duplicates" button, section header, and footer all drift out of sync.
+ *
+ * Recomputes from the freshly-fetched openTabs and the live DOM:
+ *   - Card tab count: number of openTabs whose URL matches a chip in this card
+ *   - Card dupes: sum of (Nx) values on remaining chips
+ *   - Section header: domain count from live (non-closing) cards, total from getRealTabs()
+ *   - Footer: openTabs.length
+ *
+ * Counts on the card use openTabs URL match (not DOM chip count) so a chip
+ * representing N duplicates that was just decremented still contributes its
+ * remaining instances to the total.
+ */
+function recomputeOpenTabsCounts(ownerCard) {
+  if (ownerCard) {
+    const chipUrls = new Set();
+    ownerCard.querySelectorAll('.page-chip[data-action="focus-tab"]').forEach(c => {
+      if (c.dataset.tabUrl) chipUrls.add(c.dataset.tabUrl);
+    });
+    const cardTabCount = openTabs.filter(t => chipUrls.has(t.url)).length;
+
+    let extras = 0;
+    ownerCard.querySelectorAll('.chip-dupe-badge').forEach(b => {
+      const m = b.textContent.match(/\((\d+)x\)/);
+      if (m) extras += parseInt(m[1], 10) - 1;
+    });
+
+    const tabBadge = ownerCard.querySelector('.tabs-count-badge');
+    if (tabBadge && cardTabCount > 0) {
+      tabBadge.innerHTML = `${ICONS.tabs} ${cardTabCount} tab${cardTabCount !== 1 ? 's' : ''} open`;
+    }
+
+    const dupesBadge = ownerCard.querySelector('.dupes-count-badge');
+    if (dupesBadge) {
+      if (extras > 0) {
+        dupesBadge.innerHTML = `${extras} duplicate${extras !== 1 ? 's' : ''}`;
+      } else {
+        dupesBadge.remove();
+      }
+    }
+
+    const closeAllBtn = ownerCard.querySelector('.action-btn.close-tabs[data-action="close-domain-tabs"]');
+    if (closeAllBtn && cardTabCount > 0) {
+      closeAllBtn.innerHTML = `${ICONS.close} Close all ${cardTabCount} tab${cardTabCount !== 1 ? 's' : ''}`;
+    }
+
+    const dedupBtn = ownerCard.querySelector('.action-btn[data-action="dedup-keep-one"]');
+    if (dedupBtn) {
+      if (extras > 0) {
+        dedupBtn.innerHTML = `Close ${extras} duplicate${extras !== 1 ? 's' : ''}`;
+      } else {
+        dedupBtn.remove();
+      }
+    }
+  }
+
+  const sectionCount = document.getElementById('openTabsSectionCount');
+  if (sectionCount) {
+    const realCount = getRealTabs().length;
+    const liveCards = document.querySelectorAll('.mission-card:not(.closing)').length;
+    sectionCount.innerHTML = `${liveCards} domain${liveCards !== 1 ? 's' : ''} &nbsp;&middot;&nbsp; <button class="action-btn close-tabs" data-action="close-all-open-tabs" style="font-size:11px;padding:3px 10px;">${ICONS.close} Close all ${realCount} tabs</button>`;
+  }
+
+  const statTabs = document.getElementById('statTabs');
+  if (statTabs) statTabs.textContent = openTabs.length;
+}
+
+/**
  * showToast(message)
  *
  * Brief pop-up notification at the bottom of the screen.
@@ -1245,13 +1316,13 @@ function renderDomainCard(group) {
   const hasDupes   = dupeUrls.length > 0;
   const totalExtras = dupeUrls.reduce((s, [, c]) => s + c - 1, 0);
 
-  const tabBadge = `<span class="open-tabs-badge">
+  const tabBadge = `<span class="open-tabs-badge tabs-count-badge">
     ${ICONS.tabs}
     ${tabCount} tab${tabCount !== 1 ? 's' : ''} open
   </span>`;
 
   const dupeBadge = hasDupes
-    ? `<span class="open-tabs-badge" style="color:var(--accent-amber);background:rgba(200,113,58,0.08);">
+    ? `<span class="open-tabs-badge dupes-count-badge" style="color:var(--accent-amber);background:rgba(200,113,58,0.08);">
         ${totalExtras} duplicate${totalExtras !== 1 ? 's' : ''}
       </span>`
     : '';
@@ -2013,7 +2084,10 @@ document.addEventListener('click', async (e) => {
     const tabUrl = actionEl.dataset.tabUrl;
     if (!tabUrl) return;
 
-    // Close the tab in Chrome directly
+    const chip      = actionEl.closest('.page-chip');
+    const ownerCard = chip ? chip.closest('.mission-card') : null;
+
+    // Close one matching tab in Chrome (URL match)
     const allTabs = await chrome.tabs.query({});
     const match   = allTabs.find(t => t.url === tabUrl);
     if (match) await chrome.tabs.remove(match.id);
@@ -2021,8 +2095,27 @@ document.addEventListener('click', async (e) => {
 
     playCloseSound();
 
-    // Animate the chip row out
-    const chip = actionEl.closest('.page-chip');
+    // If this URL still has remaining duplicates, keep the chip and just
+    // decrement its (Nx) badge instead of removing it.
+    const dupeBadge = chip?.querySelector('.chip-dupe-badge');
+    if (dupeBadge) {
+      const m = dupeBadge.textContent.match(/\((\d+)x\)/);
+      if (m) {
+        const next = parseInt(m[1], 10) - 1;
+        if (next > 1) {
+          dupeBadge.textContent = ` (${next}x)`;
+        } else {
+          dupeBadge.remove();
+          chip.classList.remove('chip-has-dupes');
+        }
+        recomputeOpenTabsCounts(ownerCard);
+        showToast('Tab closed');
+        return;
+      }
+    }
+
+    // No duplicates: fade the chip out, then refresh counts and possibly the
+    // empty card.
     if (chip) {
       const rect = chip.getBoundingClientRect();
       shootConfetti(rect.left + rect.width / 2, rect.top + rect.height / 2);
@@ -2031,20 +2124,16 @@ document.addEventListener('click', async (e) => {
       chip.style.transform  = 'scale(0.8)';
       setTimeout(() => {
         chip.remove();
-        // If the card now has no tabs, remove it too
-        const parentCard = document.querySelector('.mission-card:has(.mission-pages:empty)');
-        if (parentCard) animateCardOut(parentCard);
+        recomputeOpenTabsCounts(ownerCard);
         document.querySelectorAll('.mission-card').forEach(c => {
           if (c.querySelectorAll('.page-chip[data-action="focus-tab"]').length === 0) {
             animateCardOut(c);
           }
         });
       }, 200);
+    } else {
+      recomputeOpenTabsCounts(ownerCard);
     }
-
-    // Update footer
-    const statTabs = document.getElementById('statTabs');
-    if (statTabs) statTabs.textContent = openTabs.length;
 
     showToast('Tab closed');
     return;
@@ -2057,7 +2146,9 @@ document.addEventListener('click', async (e) => {
     const tabTitle = actionEl.dataset.tabTitle || tabUrl;
     if (!tabUrl) return;
 
-    // Save to chrome.storage.local
+    const chip      = actionEl.closest('.page-chip');
+    const ownerCard = chip ? chip.closest('.mission-card') : null;
+
     try {
       await saveTabForLater({ url: tabUrl, title: tabTitle });
     } catch (err) {
@@ -2066,19 +2157,45 @@ document.addEventListener('click', async (e) => {
       return;
     }
 
-    // Close the tab in Chrome
     const allTabs = await chrome.tabs.query({});
     const match   = allTabs.find(t => t.url === tabUrl);
     if (match) await chrome.tabs.remove(match.id);
     await fetchOpenTabs();
 
-    // Animate chip out
-    const chip = actionEl.closest('.page-chip');
+    // If duplicates remain, keep the chip and decrement its badge
+    const dupeBadge = chip?.querySelector('.chip-dupe-badge');
+    if (dupeBadge) {
+      const m = dupeBadge.textContent.match(/\((\d+)x\)/);
+      if (m) {
+        const next = parseInt(m[1], 10) - 1;
+        if (next > 1) {
+          dupeBadge.textContent = ` (${next}x)`;
+        } else {
+          dupeBadge.remove();
+          chip.classList.remove('chip-has-dupes');
+        }
+        recomputeOpenTabsCounts(ownerCard);
+        showToast('Saved for later');
+        await renderDeferredColumn();
+        return;
+      }
+    }
+
     if (chip) {
       chip.style.transition = 'opacity 0.2s, transform 0.2s';
       chip.style.opacity    = '0';
       chip.style.transform  = 'scale(0.8)';
-      setTimeout(() => chip.remove(), 200);
+      setTimeout(() => {
+        chip.remove();
+        recomputeOpenTabsCounts(ownerCard);
+        document.querySelectorAll('.mission-card').forEach(c => {
+          if (c.querySelectorAll('.page-chip[data-action="focus-tab"]').length === 0) {
+            animateCardOut(c);
+          }
+        });
+      }, 200);
+    } else {
+      recomputeOpenTabsCounts(ownerCard);
     }
 
     showToast('Saved for later');

@@ -76,7 +76,7 @@ Hover a tab chip, click the bookmark icon, the tab moves into the "Saved for lat
 
 ### Duplicate detection
 
-If two tabs share the same exact URL, both chips get an amber `(2x)` badge and the card surfaces a "Close N duplicates" action. Open multiple Tab Out tabs themselves? A top-of-page banner offers a one-click "Close extras".
+If multiple tabs share the same exact URL, the chip shows an amber `(Nx)` badge with the duplicate count and the card surfaces a "Close N duplicates" action. Closing the chip closes one instance at a time, with the badge decrementing in place until only one tab remains. Open multiple Tab Out tabs themselves? A top-of-page banner offers a one-click "Close extras".
 
 ### Per-card actions
 

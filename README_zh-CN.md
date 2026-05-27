@@ -76,7 +76,7 @@ git clone https://github.com/lingduo1994/tab-out.git
 
 ### 重复标签检测
 
-如果两个标签 URL 完全一致，每个 chip 会出现一个琥珀色 `(2x)` 徽标，所在卡片会出现 "Close N duplicates" 按钮。开了多个 Tab Out 新标签页本身？顶部 banner 会提示并提供 "Close extras" 一键关掉。
+如果多个标签 URL 完全一致，对应的 chip 上会出现一个琥珀色 `(Nx)` 徽标显示重复数量，所在卡片会出现 "Close N duplicates" 按钮。点 chip 上的 × 一次关一份，徽标计数会原地递减，直到只剩一份。开了多个 Tab Out 新标签页本身？顶部 banner 会提示并提供 "Close extras" 一键关掉。
 
 ### 卡片内操作
 
